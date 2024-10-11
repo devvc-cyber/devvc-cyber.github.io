@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Simulador da Clínica Médica</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+        }
+        #game-container {
+            width: 100%;
+            height: 600px;
+            overflow: hidden;
+        }
+        #controls {
+            margin: 20px;
+            display: flex;
+            align-items: center;
+        }
+        #timer-display {
+            margin-left: 20px;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        #log-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        #log-table th, #log-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+        }
+        #charts {
+            width: 80%;
+            margin: 20px auto;
+        }
+    </style>
+</head>
+<body>
+
+<div id="controls">
+    <label for="num-patients">Número total de pacientes (máximo 40): </label>
+    <input type="number" id="num-patients" value="40" min="1" max="40">
+    <button id="start-simulation">Iniciar Simulação</button>
+    <div id="timer-display">Tempo: 6h00</div>
+</div>
+
+<div id="game-container"></div>
+
+<table id="log-table">
+    <thead>
+        <tr>
+            <th>Paciente</th>
+            <th>Etapa</th>
+            <th>Tempo Inicial</th>
+            <th>Tempo Final</th>
+            <th>Tempo Total na Etapa</th>
+        </tr>
+    </thead>
+    <tbody id="log-body">
+    </tbody>
+</table>
+
+<div id="charts">
+    <canvas id="waitingTimeChart"></canvas>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+    let config;
+    let game;
+
+    // Variáveis globais necessárias
+    const averageDistribution = {
+        'F1': 6,
+        'F2': 12,
+        'M1': 2,
+        'M2': 20,
+        'E': 5
+    };
+
+    // Cores para os grupos
+    const groupColors = {
+        'F1': 0xff69b4, // Rosa
+        'F2': 0xff1493, // Rosa Escuro
+        'M1': 0x1e90ff, // Azul Claro
+        'M2': 0x0000cd, // Azul Escuro
+        'E': 0x228b22   // Verde
+    };
+
+    // Legenda dos grupos
+    const groupLegend = {
+        'F1': 'Mulheres até 40 anos',
+        'F2': 'Mulheres com mais de 40 anos',
+        'M1': 'Homens com menos de 40 anos',
+        'M2': 'Homens com mais de 40 anos',
+        'E': 'Pessoas acima de 65 anos'
+    };
+
+    document.getElementById('start-simulation').addEventListener('click', () => {
+        const numPatients = parseInt(document.getElementById('num-patients').value);
+        if (numPatients > 40 || numPatients < 1) {
+            alert('O número de pacientes deve ser entre 1 e 40.');
+            return;
+        }
+        // Limpar dados anteriores
+        if (game) {
+            game.destroy(true);
+            game = null;
+            document.getElementById('log-body').innerHTML = '';
+            if (Chart.getChart('waitingTimeChart')) {
+                Chart.getChart('waitingTimeChart').destroy();
+            } else {
+                // Alternativamente, destruir todos os gráficos
+                Chart.helpers.each(Chart.instances, function(instance){
+                    instance.destroy();
+                });
+            }
+        }
+        startSimulation(numPatients);
+    });
+
+    function startSimulation(numPatients) {
+        // Ajustar distribuição de pacientes proporcionalmente
+        const totalAverage = Object.values(averageDistribution).reduce((a, b) => a + b);
+        const patientDistribution = {};
+        let totalAssigned = 0;
+
+        for (const group in averageDistribution) {
+            patientDistribution[group] = Math.round((averageDistribution[group] / totalAverage) * numPatients);
+            totalAssigned += patientDistribution[group];
+        }
+
+        // Ajustar se houver diferença devido ao arredondamento
+        const difference = numPatients - totalAssigned;
+        if (difference !== 0) {
+            patientDistribution['M2'] += difference;
+        }
+
+        // Definir a cena como uma classe personalizada
+        class ClinicScene extends Phaser.Scene {
+            constructor() {
+                super({ key: 'ClinicScene' });
+            }
+
+            init(data) {
+                this.numPatients = data.numPatients;
+                this.patientDistribution = data.patientDistribution;
+                this.patients = [];
+                this.stages = [];
+                this.logs = [];
+                this.chartsGenerated = false;
+
+                // Variáveis globais dentro da cena
+                this.groupColors = groupColors;
+                this.groupLegend = groupLegend;
+
+                // Etapas da clínica
+                this.clinicStages = [
+                    { id: 1, name: 'Admissão via Totem', tm: 5, ga: ['TODOS'], capacity: 4, occupants: [], dependencies: [] },
+                    { id: 2, name: 'Vestiário', tm: 10, ga: ['TODOS'], capacity: Infinity, occupants: [], dependencies: [1] },
+                    { id: 3, name: 'Triagem', tm: 10, ga: ['TODOS'], capacity: 3, occupants: [], dependencies: [2] },
+                    { id: 4, name: 'Coleta', tm: 10, ga: ['TODOS'], capacity: 3, occupants: [], dependencies: [3] },
+                    { id: 5, name: 'Clínico', tm: 40, ga: ['TODOS'], capacity: 7, occupants: [], dependencies: [4] },
+                    { id: 6, name: 'Ultrassom', tm: 20, ga: ['TODOS'], capacity: 4, occupants: [], dependencies: [5] },
+                    { id: 7, name: 'Pausa para Lanche', tm: 20, ga: ['TODOS'], capacity: Infinity, occupants: [], dependencies: [6] },
+                    { id: 8, name: 'Ginecologia', tm: 20, ga: ['F1', 'F2'], capacity: 2, occupants: [], dependencies: [5] },
+                    { id: 9, name: 'Urologia', tm: 20, ga: ['M2'], capacity: 2, occupants: [], dependencies: [5] },
+                    { id: 10, name: 'Teste Ergométrico', tm: 40, ga: ['TODOS'], capacity: 3, occupants: [], dependencies: [7] },
+                    { id: 11, name: 'Oftalmologia', tm: 20, ga: ['TODOS'], capacity: 3, occupants: [], dependencies: [7] },
+                    { id: 12, name: 'Dermatologia', tm: 20, ga: ['TODOS'], capacity: 3, occupants: [], dependencies: [7] },
+                    { id: 13, name: 'Fonoaudiólogo', tm: 20, ga: ['M2', 'F2'], capacity: 2, occupants: [], dependencies: [7] },
+                    { id: 14, name: 'Mamografia', tm: 20, ga: ['F2'], capacity: 1, occupants: [], dependencies: [8] },
+                    { id: 15, name: 'Avaliação Funcional do Idoso', tm: 20, ga: ['E'], capacity: 1, occupants: [], dependencies: [5] },
+                    { id: 16, name: 'Saída do Checkup', tm: 5, ga: ['TODOS'], capacity: Infinity, occupants: [], dependencies: [] },
+                    { id: 17, name: 'Sala de Espera', tm: 5, ga: ['TODOS'], capacity: Infinity, occupants: [] }
+                ];
+            }
+
+            preload() {
+                // Pré-carregamento de recursos, se necessário
+            }
+
+            create() {
+                const scene = this;
+
+                // Criar etapas
+                const stageWidth = 200;
+                const stageHeight = 100;
+                const spacing = 20;
+                const cols = Math.floor(this.sys.game.config.width / (stageWidth + spacing));
+                this.stages = this.clinicStages.map((stage, index) => {
+                    const x = (index % cols) * (stageWidth + spacing) + spacing;
+                    const y = Math.floor(index / cols) * (stageHeight + spacing) + spacing;
+                    const rect = scene.add.rectangle(x, y, stageWidth, stageHeight, 0xffffff).setOrigin(0);
+                    const text = scene.add.text(x + 10, y + 10, `${stage.name}\nCT: ${stage.capacity}\nCM: 0`, { fontSize: '12px', fill: '#000' });
+                    return { ...stage, rect, text, x, y };
+                });
+
+                // Criar pacientes
+                let patientId = 1;
+                for (const group in this.patientDistribution) {
+                    const count = this.patientDistribution[group];
+                    for (let i = 0; i < count; i++) {
+                        const stagesSequence = this.getStagesSequence(group);
+                        const patient = {
+                            id: `${group}-${patientId}`,
+                            group: group,
+                            color: this.groupColors[group],
+                            position: { x: 0, y: 0 },
+                            currentStage: null,
+                            completedStages: [],
+                            waitTime: 0,
+                            totalWaitTime: 0,
+                            totalTimeInClinic: 0,
+                            hasArrived: false,
+                            arrivalTime: this.getRandomNormal(0, 100), // Entre 0 e 100 minutos
+                            stagesSequence: stagesSequence,
+                            lastStageId: stagesSequence[stagesSequence.length - 1],
+                            sprite: null
+                        };
+                        this.patients.push(patient);
+                        patientId++;
+                    }
+                }
+
+                // Ordenar pacientes por tempo de chegada
+                this.patients.sort((a, b) => a.arrivalTime - b.arrivalTime);
+
+                // Legenda
+                let legendY = this.sys.game.config.height - 200;
+                for (const group in this.groupLegend) {
+                    const color = this.groupColors[group];
+                    scene.add.rectangle(20, legendY, 20, 20, color).setOrigin(0);
+                    scene.add.text(50, legendY + 5, `${group}: ${this.groupLegend[group]}`, { fontSize: '14px', fill: '#000' });
+                    legendY += 30;
+                }
+
+                // Timer Display
+                this.timerDisplay = document.getElementById('timer-display');
+            }
+
+            update() {
+                const scene = this;
+
+                // Atualização do jogo
+                this.patients.forEach(patient => {
+                    // Verificar se o paciente já chegou
+                    if (!patient.hasArrived && scene.getCurrentTime() >= patient.arrivalTime) {
+                        patient.hasArrived = true;
+                        patient.startTime = scene.getCurrentTime();
+                        scene.moveToNextStage(patient);
+                    }
+                });
+
+                // Atualizar a capacidade ocupada (CM) em cada etapa
+                this.stages.forEach(stage => {
+                    const cm = stage.occupants.length;
+                    stage.text.setText(`${stage.name}\nCT: ${stage.capacity}\nCM: ${cm}`);
+                });
+
+                // Atualizar o timer
+                const currentTimeFormatted = this.formatTime(this.getCurrentTime().toFixed(2));
+                this.timerDisplay.textContent = `Tempo: ${currentTimeFormatted}`;
+
+                // Verificar se todos os pacientes concluíram para gerar gráficos
+                if (this.patients.every(p => p.completedStages.includes(16)) && !this.chartsGenerated) {
+                    this.chartsGenerated = true;
+                    this.generateCharts();
+                }
+            }
+
+            getCurrentTime() {
+                return this.time.now / 1000;
+            }
+
+            getStagesSequence(group) {
+                // Retornar a sequência de etapas para o grupo
+                let sequence = [1, 2, 3, 4]; // Etapas iniciais: Admissão, Vestiário, Triagem, Coleta
+
+                // Garantir que o Ultrassom seja uma das etapas iniciais
+                sequence.push(6);
+
+                // Regras adicionais
+                if (group === 'F1' || group === 'F2') {
+                    sequence.push(8); // Ginecologia
+                    if (group === 'F2') {
+                        sequence.push(14); // Mamografia
+                    }
+                }
+                if (group === 'M2') {
+                    sequence.push(9); // Urologia
+                }
+                if (group === 'E') {
+                    sequence.push(15); // Avaliação Funcional do Idoso
+                }
+
+                // Pausa para Lanche não pode ocorrer antes do Ultrassom
+                sequence.push(7); // Pausa para Lanche
+
+                // Etapas finais
+                sequence.push(10, 11, 12);
+
+                // Fonoaudiólogo para M2 e F2
+                if (group === 'M2' || group === 'F2') {
+                    sequence.push(13);
+                }
+
+                // A etapa final será "Saída do Checkup" após a última etapa específica
+                return sequence;
+            }
+
+            getAvailableStages(patient) {
+                // Retornar as etapas disponíveis para o paciente, respeitando as dependências e regras
+                return this.stages.filter(stage => {
+                    // Verificar se o paciente já completou esta etapa
+                    if (patient.completedStages.includes(stage.id)) return false;
+
+                    // Verificar se o paciente pertence ao grupo alvo da etapa
+                    if (!stage.ga.includes('TODOS') && !stage.ga.includes(patient.group)) return false;
+
+                    // Verificar dependências
+                    if (stage.dependencies && stage.dependencies.length > 0) {
+                        for (let dep of stage.dependencies) {
+                            if (!patient.completedStages.includes(dep)) return false;
+                        }
+                    }
+
+                    // Regras específicas
+                    if (stage.id === 7 && !patient.completedStages.includes(6)) {
+                        // Pausa para Lanche não pode ocorrer antes do Ultrassom
+                        return false;
+                    }
+
+                    // Disponibilizar "Saída do Checkup" somente após a última etapa específica
+                    if (stage.id === 16) {
+                        if (!patient.completedStages.includes(patient.lastStageId)) {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                });
+            }
+
+            moveToNextStage(patient) {
+                const availableStages = this.getAvailableStages(patient);
+
+                if (availableStages.length === 0) {
+                    // Paciente completou todas as etapas
+                    return;
+                }
+
+                // Tentar atribuir o paciente a uma das etapas disponíveis
+                for (let stage of availableStages) {
+                    if (stage.capacity > stage.occupants.length) {
+                        this.assignPatientToStage(patient, stage);
+                        return;
+                    }
+                }
+
+                // Se nenhuma etapa disponível tem capacidade, mover para a Sala de Espera
+                const waitingStage = this.stages.find(s => s.name === 'Sala de Espera');
+
+                // Registrar entrada na Sala de Espera
+                const logEntry = {
+                    paciente: patient.id,
+                    etapa: waitingStage.name,
+                    tempoInicial: this.getCurrentTime().toFixed(2),
+                    tempoFinal: (this.getCurrentTime() + waitingStage.tm).toFixed(2),
+                    tempoTotal: waitingStage.tm
+                };
+                this.logs.push(logEntry);
+                this.addLogToTable(logEntry);
+
+                waitingStage.occupants.push(patient);
+                patient.currentStage = waitingStage;
+
+                // Atualizar posição do paciente
+                if (!patient.sprite) {
+                    patient.sprite = this.add.circle(waitingStage.x + 20, waitingStage.y + 80, 10, patient.color);
+                } else {
+                    this.tweens.add({
+                        targets: patient.sprite,
+                        x: waitingStage.x + 20 + (waitingStage.occupants.length * 15),
+                        y: waitingStage.y + 80,
+                        duration: 500
+                    });
+                }
+
+                // Registrar tempo de espera
+                patient.totalWaitTime += waitingStage.tm;
+
+                // Agendar tentativa novamente após o tempo de espera
+                this.time.delayedCall(waitingStage.tm * 1000, () => {
+                    waitingStage.occupants = waitingStage.occupants.filter(p => p.id !== patient.id);
+                    this.moveToNextStage(patient);
+                }, [], this);
+            }
+
+            assignPatientToStage(patient, stage) {
+                stage.occupants.push(patient);
+                patient.currentStage = stage;
+
+                // Registrar log
+                const logEntry = {
+                    paciente: patient.id,
+                    etapa: stage.name,
+                    tempoInicial: this.getCurrentTime().toFixed(2),
+                    tempoFinal: (this.getCurrentTime() + stage.tm).toFixed(2),
+                    tempoTotal: stage.tm
+                };
+                this.logs.push(logEntry);
+                this.addLogToTable(logEntry);
+
+                // Atualizar posição do paciente
+                if (!patient.sprite) {
+                    patient.sprite = this.add.circle(stage.x + 20, stage.y + 80, 10, patient.color);
+                } else {
+                    this.tweens.add({
+                        targets: patient.sprite,
+                        x: stage.x + 20 + (stage.occupants.length * 15),
+                        y: stage.y + 80,
+                        duration: 500
+                    });
+                }
+
+                // Agendar saída do paciente da etapa
+                this.time.delayedCall(stage.tm * 1000, () => {
+                    stage.occupants = stage.occupants.filter(p => p.id !== patient.id);
+                    patient.completedStages.push(stage.id);
+                    if (stage.id === 16) {
+                        // Paciente concluiu todas as etapas
+                        if (patient.sprite) {
+                            patient.sprite.destroy();
+                        }
+                        // Registrar tempo total na clínica
+                        patient.totalTimeInClinic = this.getCurrentTime() - patient.startTime;
+                    } else {
+                        this.moveToNextStage(patient);
+                    }
+                }, [], this);
+            }
+
+            formatTime(time) {
+                const totalMinutes = parseFloat(time);
+                const hours = Math.floor(totalMinutes / 60); // Horas no formato 0-23
+                const minutes = Math.floor(totalMinutes % 60);
+                return `${hours + 6}h${minutes < 10 ? '0' : ''}${minutes}`; // Adicionando 6 horas para começar às 6h
+            }
+
+            addLogToTable(logEntry) {
+                const logBody = document.getElementById('log-body');
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${logEntry.paciente}</td>
+                    <td>${logEntry.etapa}</td>
+                    <td>${this.formatTime(logEntry.tempoInicial)}</td>
+                    <td>${this.formatTime(logEntry.tempoFinal)}</td>
+                    <td>${logEntry.tempoTotal} min</td>
+                `;
+                logBody.appendChild(row);
+            }
+
+            getRandomNormal(min, max) {
+                // Gerar um número aleatório com distribuição normal
+                let u = 0, v = 0;
+                while(u === 0) u = Math.random(); // Converte [0,1) para (0,1)
+                while(v === 0) v = Math.random();
+                let num = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+                num = num / 10.0 + 0.5; // Converte para distribuição normal padrão
+                if (num > 1 || num < 0) return this.getRandomNormal(min, max); // Rejeita valores fora do intervalo
+                num *= (max - min);
+                num += min;
+                return num;
+            }
+
+            generateCharts() {
+                // Gerar gráfico de tempo total na clínica por paciente
+                const totalTimes = this.patients.map(p => ({
+                    id: p.id,
+                    totalTimeInClinic: p.totalTimeInClinic
+                }));
+
+                const labels = totalTimes.map(tt => tt.id);
+                const data = totalTimes.map(tt => tt.totalTimeInClinic);
+
+                const ctx = document.getElementById('waitingTimeChart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Tempo Total na Clínica (min)',
+                            data: data,
+                            backgroundColor: 'rgba(54, 162, 235, 0.6)'
+                        }]
+                    },
+                    options: {
+                        scales: {
+                            x: {
+                                title: {
+                                    display: true,
+                                    text: 'Pacientes'
+                                }
+                            },
+                            y: {
+                                title: {
+                                    display: true,
+                                    text: 'Tempo (minutos)'
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Análise de gargalos
+                this.analyzeBottlenecks();
+            }
+
+            analyzeBottlenecks() {
+                // Identificar etapas com maior tempo total gasto
+                const timesPerStage = {};
+
+                this.logs.forEach(log => {
+                    const stageName = log.etapa;
+                    if (!timesPerStage[stageName]) {
+                        timesPerStage[stageName] = 0;
+                    }
+                    timesPerStage[stageName] += parseFloat(log.tempoTotal);
+                });
+
+                // Ordenar etapas por tempo total gasto
+                const sortedStages = Object.entries(timesPerStage).sort((a, b) => b[1] - a[1]);
+
+                console.log('Análise de Gargalos:');
+                sortedStages.forEach(([stage, time]) => {
+                    console.log(`Etapa: ${stage}, Tempo Total: ${time.toFixed(2)} minutos`);
+                });
+            }
+        }
+
+        // Configurações iniciais
+        config = {
+            type: Phaser.AUTO,
+            width: window.innerWidth,
+            height: 600,
+            backgroundColor: '#f0f0f0',
+            parent: 'game-container',
+            scene: [], // Nenhuma cena inicial
+            audio: {
+                noAudio: true // Desabilitar áudio para evitar erros relacionados ao AudioContext
+            }
+        };
+
+        game = new Phaser.Game(config);
+
+        // Adicionar a cena ao jogo e iniciá-la com os dados necessários
+        game.scene.add('ClinicScene', ClinicScene, true, { numPatients: numPatients, patientDistribution: patientDistribution });
+    }
+</script>
+</body>
+</html>
